@@ -93,6 +93,7 @@ jobs:
           package pl.yi.podglad
 
           import android.app.Activity
+          import android.app.AlertDialog
           import android.graphics.Color
           import android.graphics.drawable.GradientDrawable
           import android.net.ConnectivityManager
@@ -128,6 +129,12 @@ jobs:
               @Volatile var connected = false
               private var socket: Socket? = null
               private var out: OutputStream? = null
+              private val waiting = java.util.concurrent.ConcurrentHashMap<Int, (JSONObject) -> Unit>()
+
+              fun request(msgId: Int, param: String?, cb: (JSONObject) -> Unit) {
+                  waiting[msgId] = cb
+                  send(msgId, param)
+              }
 
               fun connect(): Boolean {
                   try {
@@ -180,15 +187,17 @@ jobs:
                       if (j.optInt("msg_id") == 257 && j.optInt("rval", -1) == 0) {
                           token = j.optInt("param", 0)
                       }
+                      waiting.remove(j.optInt("msg_id"))?.invoke(j)
                   } catch (e: Exception) {
                   }
               }
 
-              fun send(msgId: Int, param: String?) {
+              fun send(msgId: Int, param: String?, type: String? = null) {
                   try {
                       val j = JSONObject()
                       j.put("msg_id", msgId)
                       j.put("token", token)
+                      if (type != null) j.put("type", type)
                       if (param != null) j.put("param", param)
                       synchronized(this) {
                           out?.write(j.toString().toByteArray())
@@ -220,6 +229,8 @@ jobs:
               private lateinit var status: TextView
               private lateinit var recBtn: Button
               private lateinit var panel: LinearLayout
+              private lateinit var modeBtn: Button
+              private var fast = true
               private var recStart = 0L
               private var player: ExoPlayer? = null
               private var control: CameraControl? = null
@@ -256,15 +267,24 @@ jobs:
 
                   recBtn = makeButton("Nagrywaj", Color.parseColor("#C62828")) { toggleRec() }
                   val photoBtn = makeButton("Zdjęcie", Color.parseColor("#37474F")) { takePhoto() }
-                  val reBtn = makeButton("Połącz ponownie", Color.parseColor("#37474F")) { connectFlow() }
+                  val setBtn = makeButton("Ustawienia", Color.parseColor("#1565C0")) { openSettings() }
+                  val reBtn = makeButton("Połącz", Color.parseColor("#37474F")) { connectFlow() }
                   row.addView(recBtn)
                   row.addView(photoBtn)
+                  row.addView(setBtn)
                   row.addView(reBtn)
+
+                  val row2 = LinearLayout(this)
+                  row2.orientation = LinearLayout.HORIZONTAL
+                  row2.setPadding(dp(8), 0, dp(8), dp(12))
+                  modeBtn = makeButton("Tryb: Szybki", Color.parseColor("#2E7D32")) { toggleMode() }
+                  row2.addView(modeBtn)
 
                   panel = LinearLayout(this)
                   panel.orientation = LinearLayout.VERTICAL
                   panel.addView(status)
                   panel.addView(row)
+                  panel.addView(row2)
 
                   root.addView(playerView)
                   root.addView(panel)
@@ -293,12 +313,34 @@ jobs:
                   }
               }
 
+              private val catchUp = object : Runnable {
+                  override fun run() {
+                      val p = player
+                      if (p != null && active) {
+                          val ahead = p.bufferedPosition - p.currentPosition
+                          p.setPlaybackSpeed(if (fast && ahead > 400) 1.15f else 1.0f)
+                          ui.postDelayed(this, 500)
+                      }
+                  }
+              }
+
+              private fun toggleMode() {
+                  fast = !fast
+                  modeBtn.text = if (fast) "Tryb: Szybki" else "Tryb: Stabilny"
+                  modeBtn.background = GradientDrawable().also {
+                      it.setColor(Color.parseColor(if (fast) "#2E7D32" else "#EF6C00"))
+                      it.cornerRadius = dp(14).toFloat()
+                  }
+                  setStatus(if (fast) "Tryb szybki: najmniejsze opóźnienie (UDP)" else "Tryb stabilny: pewniejszy obraz (TCP)")
+                  if (active) startPlayer()
+              }
+
               private fun makeButton(label: String, color: Int, action: () -> Unit): Button {
                   val b = Button(this)
                   b.text = label
                   b.isAllCaps = false
                   b.setTextColor(Color.WHITE)
-                  b.textSize = 14f
+                  b.textSize = 13f
                   val bg = GradientDrawable()
                   bg.setColor(color)
                   bg.cornerRadius = dp(14).toFloat()
@@ -382,12 +424,14 @@ jobs:
 
               private fun startPlayer() {
                   releasePlayer()
-                  val load = DefaultLoadControl.Builder()
-                      .setBufferDurationsMs(100, 1000, 100, 100)
-                      .build()
+                  val lb = DefaultLoadControl.Builder()
+                  if (fast) lb.setBufferDurationsMs(50, 500, 50, 50)
+                  else lb.setBufferDurationsMs(500, 3000, 300, 300)
+                  lb.setPrioritizeTimeOverSizeThresholds(true)
+                  val load = lb.build()
                   val p = ExoPlayer.Builder(this).setLoadControl(load).build()
                   val src = RtspMediaSource.Factory()
-                      .setForceUseRtpTcp(true)
+                      .setForceUseRtpTcp(!fast)
                       .setTimeoutMs(8000)
                       .createMediaSource(MediaItem.fromUri(RTSP))
                   p.addListener(object : Player.Listener {
@@ -405,6 +449,8 @@ jobs:
                   p.playWhenReady = true
                   playerView.player = p
                   player = p
+                  ui.removeCallbacks(catchUp)
+                  ui.postDelayed(catchUp, 500)
               }
 
               private fun releasePlayer() {
@@ -428,6 +474,76 @@ jobs:
                       ui.post(ticker)
                   } else {
                       setStatus("Nagrywanie zatrzymane")
+                  }
+              }
+
+              private fun openSettings() {
+                  val c = control
+                  if (c == null || !c.connected) {
+                      setStatus("Brak połączenia ze sterowaniem")
+                      return
+                  }
+                  setStatus("Pobieram ustawienia...")
+                  c.request(3, null) { j ->
+                      val arr = j.optJSONArray("param")
+                      val names = ArrayList<String>()
+                      val labels = ArrayList<String>()
+                      if (arr != null) {
+                          for (i in 0 until arr.length()) {
+                              val o = arr.optJSONObject(i)
+                              if (o != null) {
+                                  val keys = o.keys()
+                                  while (keys.hasNext()) {
+                                      val key = keys.next()
+                                      names.add(key)
+                                      labels.add(key + ": " + o.optString(key))
+                                  }
+                              }
+                          }
+                      }
+                      runOnUiThread {
+                          if (names.isEmpty()) {
+                              setStatus("Kamera nie zwróciła ustawień")
+                          } else {
+                              setStatus("Wybierz ustawienie")
+                              AlertDialog.Builder(this)
+                                  .setTitle("Ustawienia kamery")
+                                  .setItems(labels.toTypedArray()) { _, which -> openOption(names[which]) }
+                                  .setNegativeButton("Zamknij", null)
+                                  .show()
+                          }
+                      }
+                  }
+                  ui.postDelayed({
+                      if (status.text.toString() == "Pobieram ustawienia...") setStatus("Brak odpowiedzi kamery")
+                  }, 4000)
+              }
+
+              private fun openOption(name: String) {
+                  val c = control
+                  if (c == null) return
+                  c.request(9, name) { j ->
+                      val arr = j.optJSONArray("options")
+                      val opts = ArrayList<String>()
+                      if (arr != null) {
+                          for (i in 0 until arr.length()) opts.add(arr.optString(i))
+                      }
+                      val readonly = j.optString("permission", "settable") == "readonly"
+                      runOnUiThread {
+                          if (opts.isEmpty() || readonly) {
+                              setStatus("To ustawienie nie ma opcji do wyboru")
+                          } else {
+                              AlertDialog.Builder(this)
+                                  .setTitle(name)
+                                  .setItems(opts.toTypedArray()) { _, which ->
+                                      val value = opts[which]
+                                      io.execute { c.send(2, value, name) }
+                                      setStatus("Ustawiono: " + name + " = " + value)
+                                  }
+                                  .setNegativeButton("Anuluj", null)
+                                  .show()
+                          }
+                      }
                   }
               }
 

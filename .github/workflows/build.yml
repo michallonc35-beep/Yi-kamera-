@@ -1,0 +1,457 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Przygotuj projekt
+        run: |
+          mkdir -p src/main/java/pl/yi/podglad
+          cat > settings.gradle.kts <<'EOF_0'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "YiPodglad"
+          EOF_0
+          cat > build.gradle.kts <<'EOF_1'
+          plugins {
+              id("com.android.application") version "8.5.2"
+              id("org.jetbrains.kotlin.android") version "1.9.24"
+          }
+
+          android {
+              namespace = "pl.yi.podglad"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "pl.yi.podglad"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.media3:media3-exoplayer:1.3.1")
+              implementation("androidx.media3:media3-exoplayer-rtsp:1.3.1")
+              implementation("androidx.media3:media3-ui:1.3.1")
+          }
+          EOF_1
+          cat > gradle.properties <<'EOF_2'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_2
+          cat > src/main/AndroidManifest.xml <<'EOF_3'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+              <application
+                  android:label="Yi Podglad"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_3
+          cat > src/main/java/pl/yi/podglad/MainActivity.kt <<'EOF_4'
+          package pl.yi.podglad
+
+          import android.app.Activity
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.net.ConnectivityManager
+          import android.net.Network
+          import android.net.NetworkCapabilities
+          import android.net.NetworkRequest
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.PlaybackException
+          import androidx.media3.common.Player
+          import androidx.media3.exoplayer.DefaultLoadControl
+          import androidx.media3.exoplayer.ExoPlayer
+          import androidx.media3.exoplayer.rtsp.RtspMediaSource
+          import androidx.media3.ui.AspectRatioFrameLayout
+          import androidx.media3.ui.PlayerView
+          import org.json.JSONObject
+          import java.io.BufferedInputStream
+          import java.io.OutputStream
+          import java.net.InetSocketAddress
+          import java.net.Socket
+          import java.util.concurrent.Executors
+
+          class CameraControl {
+              @Volatile var token = 0
+              @Volatile var connected = false
+              private var socket: Socket? = null
+              private var out: OutputStream? = null
+
+              fun connect(): Boolean {
+                  try {
+                      val s = Socket()
+                      s.connect(InetSocketAddress("192.168.42.1", 7878), 4000)
+                      socket = s
+                      out = s.getOutputStream()
+                      startReader(s)
+                      send(257, null)
+                      val t0 = System.currentTimeMillis()
+                      while (token == 0 && System.currentTimeMillis() - t0 < 3000) {
+                          Thread.sleep(50)
+                      }
+                      connected = token != 0
+                  } catch (e: Exception) {
+                      connected = false
+                  }
+                  return connected
+              }
+
+              private fun startReader(s: Socket) {
+                  Thread {
+                      try {
+                          val inp = BufferedInputStream(s.getInputStream())
+                          val sb = StringBuilder()
+                          var depth = 0
+                          while (true) {
+                              val c = inp.read()
+                              if (c < 0) break
+                              val ch = c.toChar()
+                              if (ch == '{') depth++
+                              if (depth > 0) sb.append(ch)
+                              if (ch == '}') {
+                                  depth--
+                                  if (depth == 0) {
+                                      handle(sb.toString())
+                                      sb.setLength(0)
+                                  }
+                              }
+                          }
+                      } catch (e: Exception) {
+                      }
+                      connected = false
+                  }.start()
+              }
+
+              private fun handle(text: String) {
+                  try {
+                      val j = JSONObject(text)
+                      if (j.optInt("msg_id") == 257 && j.optInt("rval", -1) == 0) {
+                          token = j.optInt("param", 0)
+                      }
+                  } catch (e: Exception) {
+                  }
+              }
+
+              fun send(msgId: Int, param: String?) {
+                  try {
+                      val j = JSONObject()
+                      j.put("msg_id", msgId)
+                      j.put("token", token)
+                      if (param != null) j.put("param", param)
+                      synchronized(this) {
+                          out?.write(j.toString().toByteArray())
+                          out?.flush()
+                      }
+                  } catch (e: Exception) {
+                      connected = false
+                  }
+              }
+
+              fun close() {
+                  connected = false
+                  try {
+                      socket?.close()
+                  } catch (e: Exception) {
+                  }
+              }
+          }
+
+          class MainActivity : Activity() {
+
+              companion object {
+                  const val RTSP = "rtsp://192.168.42.1/live"
+              }
+
+              private val ui = Handler(Looper.getMainLooper())
+              private val io = Executors.newSingleThreadExecutor()
+              private lateinit var playerView: PlayerView
+              private lateinit var status: TextView
+              private lateinit var recBtn: Button
+              private lateinit var panel: LinearLayout
+              private var recStart = 0L
+              private var player: ExoPlayer? = null
+              private var control: CameraControl? = null
+              private var callback: ConnectivityManager.NetworkCallback? = null
+              private var recording = false
+              private var active = false
+              private var busy = false
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(Color.BLACK)
+
+                  playerView = PlayerView(this)
+                  playerView.useController = false
+                  playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                  playerView.layoutParams = LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+                  )
+
+                  status = TextView(this)
+                  status.setTextColor(Color.WHITE)
+                  status.textSize = 14f
+                  status.setPadding(dp(12), dp(8), dp(12), dp(8))
+
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.setPadding(dp(8), 0, dp(8), dp(12))
+
+                  recBtn = makeButton("Nagrywaj", Color.parseColor("#C62828")) { toggleRec() }
+                  val photoBtn = makeButton("Zdjęcie", Color.parseColor("#37474F")) { takePhoto() }
+                  val reBtn = makeButton("Połącz ponownie", Color.parseColor("#37474F")) { connectFlow() }
+                  row.addView(recBtn)
+                  row.addView(photoBtn)
+                  row.addView(reBtn)
+
+                  panel = LinearLayout(this)
+                  panel.orientation = LinearLayout.VERTICAL
+                  panel.addView(status)
+                  panel.addView(row)
+
+                  root.addView(playerView)
+                  root.addView(panel)
+                  root.setOnClickListener {
+                      panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                  }
+                  setContentView(root)
+              }
+
+              override fun onWindowFocusChanged(hasFocus: Boolean) {
+                  super.onWindowFocusChanged(hasFocus)
+                  if (hasFocus) {
+                      window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN
+                          or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                          or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                          or View.SYSTEM_UI_FLAG_LAYOUT_STABLE)
+                  }
+              }
+
+              private val ticker = object : Runnable {
+                  override fun run() {
+                      if (!recording) return
+                      val s = (System.currentTimeMillis() - recStart) / 1000
+                      setStatus("● Nagrywanie " + String.format("%02d:%02d", s / 60, s % 60))
+                      ui.postDelayed(this, 1000)
+                  }
+              }
+
+              private fun makeButton(label: String, color: Int, action: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = label
+                  b.isAllCaps = false
+                  b.setTextColor(Color.WHITE)
+                  b.textSize = 14f
+                  val bg = GradientDrawable()
+                  bg.setColor(color)
+                  bg.cornerRadius = dp(14).toFloat()
+                  b.background = bg
+                  b.setOnClickListener { action() }
+                  val lp = LinearLayout.LayoutParams(0, dp(52), 1f)
+                  lp.setMargins(dp(4), 0, dp(4), 0)
+                  b.layoutParams = lp
+                  return b
+              }
+
+              private fun setStatus(t: String) {
+                  status.text = t
+              }
+
+              override fun onStart() {
+                  super.onStart()
+                  active = true
+                  setStatus("Połącz telefon z Wi-Fi kamery (YDXJ_...)")
+                  val cm = getSystemService(ConnectivityManager::class.java)
+                  val req = NetworkRequest.Builder()
+                      .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                      .build()
+                  val cb = object : ConnectivityManager.NetworkCallback() {
+                      override fun onAvailable(network: Network) {
+                          cm.bindProcessToNetwork(network)
+                          runOnUiThread { connectFlow() }
+                      }
+
+                      override fun onLost(network: Network) {
+                          runOnUiThread {
+                              setStatus("Utracono Wi-Fi kamery")
+                              releasePlayer()
+                          }
+                      }
+                  }
+                  callback = cb
+                  try {
+                      cm.requestNetwork(req, cb)
+                  } catch (e: Exception) {
+                      setStatus("Błąd sieci: " + e.message)
+                  }
+              }
+
+              override fun onStop() {
+                  super.onStop()
+                  active = false
+                  val cm = getSystemService(ConnectivityManager::class.java)
+                  try {
+                      callback?.let { cm.unregisterNetworkCallback(it) }
+                  } catch (e: Exception) {
+                  }
+                  callback = null
+                  cm.bindProcessToNetwork(null)
+                  releasePlayer()
+                  val c = control
+                  control = null
+                  io.execute { c?.close() }
+              }
+
+              private fun connectFlow() {
+                  if (!active || busy) return
+                  busy = true
+                  setStatus("Łączę z kamerą...")
+                  io.execute {
+                      control?.close()
+                      val c = CameraControl()
+                      control = c
+                      val ok = c.connect()
+                      if (ok) c.send(259, "none_force")
+                      runOnUiThread {
+                          busy = false
+                          setStatus(
+                              if (ok) "Połączono ze sterowaniem, uruchamiam podgląd..."
+                              else "Sterowanie niedostępne, próbuję sam podgląd..."
+                          )
+                          ui.postDelayed({ if (active) startPlayer() }, 600)
+                      }
+                  }
+              }
+
+              private fun startPlayer() {
+                  releasePlayer()
+                  val load = DefaultLoadControl.Builder()
+                      .setBufferDurationsMs(100, 1000, 100, 100)
+                      .build()
+                  val p = ExoPlayer.Builder(this).setLoadControl(load).build()
+                  val src = RtspMediaSource.Factory()
+                      .setForceUseRtpTcp(true)
+                      .setTimeoutMs(8000)
+                      .createMediaSource(MediaItem.fromUri(RTSP))
+                  p.addListener(object : Player.Listener {
+                      override fun onPlaybackStateChanged(state: Int) {
+                          if (state == Player.STATE_READY) setStatus("Podgląd działa")
+                      }
+
+                      override fun onPlayerError(error: PlaybackException) {
+                          setStatus("Błąd podglądu, ponawiam...")
+                          ui.postDelayed({ if (active) startPlayer() }, 2000)
+                      }
+                  })
+                  p.setMediaSource(src)
+                  p.prepare()
+                  p.playWhenReady = true
+                  playerView.player = p
+                  player = p
+              }
+
+              private fun releasePlayer() {
+                  playerView.player = null
+                  player?.release()
+                  player = null
+              }
+
+              private fun toggleRec() {
+                  val c = control
+                  if (c == null || !c.connected) {
+                      setStatus("Brak połączenia ze sterowaniem")
+                      return
+                  }
+                  val start = !recording
+                  io.execute { c.send(if (start) 513 else 514, null) }
+                  recording = start
+                  recBtn.text = if (start) "Stop" else "Nagrywaj"
+                  if (start) {
+                      recStart = System.currentTimeMillis()
+                      ui.post(ticker)
+                  } else {
+                      setStatus("Nagrywanie zatrzymane")
+                  }
+              }
+
+              private fun takePhoto() {
+                  val c = control
+                  if (c == null || !c.connected) {
+                      setStatus("Brak połączenia ze sterowaniem")
+                      return
+                  }
+                  io.execute { c.send(769, null) }
+                  setStatus("Wysłano: zdjęcie")
+              }
+          }
+          EOF_4
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.7"
+      - name: Zbuduj APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Zmien nazwe pliku
+        run: cp build/outputs/apk/debug/*.apk YiPodglad.apk
+      - name: Opublikuj APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Yi Podglad v${{ github.run_number }}
+          files: YiPodglad.apk
